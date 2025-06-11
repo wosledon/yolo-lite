@@ -23,71 +23,53 @@ void preprocess(const cv::Mat &img, ncnn::Mat &in, int target_size)
 }
 
 // 后处理：解析模型输出，筛选目标并进行NMS
-void postprocess(const ncnn::Mat &out, std::vector<Object> &objects, float prob_threshold, float nms_threshold)
+void postprocess(const ncnn::Mat &out, std::vector<Object> &objects, float prob_threshold, float nms_threshold,
+                 float scale_x, float scale_y, int pad_x, int pad_y, int orig_w, int orig_h)
 {
-    // 调试输出 shape
-    std::cout << "out dims: " << out.dims << ", w: " << out.w << ", h: " << out.h << ", c: " << out.c << std::endl;
-    // 可选：打印前几行内容
-    for (int i = 0; i < std::min(5, out.h); i++)
-    {
-        const float *values = out.row(i);
-        for (int j = 0; j < std::min(10, out.w); j++)
-        {
-            std::cout << values[j] << " ";
-        }
-        std::cout << std::endl;
-    }
-    // YOLOv4输出为[N, 85]，N为检测框数，85=4(bbox)+1(obj)+80(class)
-    const int num_classes = 80;
-    const int num_fields = 5 + num_classes; // 4+1+80
-
+    // 假设 out.w == 6: [x0, y0, x1, y1, score, label]
     std::vector<Object> proposals;
-
     for (int i = 0; i < out.h; i++)
     {
         const float *values = out.row(i);
-        float obj_score = values[4];
-        if (obj_score < prob_threshold)
+        float score = values[4];
+        if (score < prob_threshold || score > 1.5f)
             continue;
-
-        // 找到最大类别分数及其索引
-        float max_class_score = 0.f;
-        int class_index = -1;
-        for (int j = 0; j < num_classes; j++)
-        {
-            float class_score = values[5 + j];
-            if (class_score > max_class_score)
-            {
-                max_class_score = class_score;
-                class_index = j;
-            }
-        }
-
-        float confidence = obj_score * max_class_score;
-        if (confidence < prob_threshold)
-            continue;
-
-        // bbox: [center_x, center_y, w, h] -> [x0, y0, x1, y1]
-        float cx = values[0];
-        float cy = values[1];
-        float w = values[2];
-        float h = values[3];
-        float x0 = cx - w * 0.5f;
-        float y0 = cy - h * 0.5f;
-        float x1 = cx + w * 0.5f;
-        float y1 = cy + h * 0.5f;
-
         Object obj;
-        obj.rect = cv::Rect_<float>(x0, y0, w, h);
-        obj.label = class_index;
-        obj.prob = confidence;
+        int target_size = 416;
+        // 对于yolov4-tiny ncnn模型，输出通常是归一化的[x0, y0, x1, y1]，即左上和右下角，且都在[0,1]区间
+        float x0i = values[0] * target_size;
+        float y0i = values[1] * target_size;
+        float x1i = values[2] * target_size;
+        float y1i = values[3] * target_size;
+        // 去padding和缩放
+        float x0 = (x0i - pad_x) / scale_x;
+        float y0 = (y0i - pad_y) / scale_y;
+        float x1 = (x1i - pad_x) / scale_x;
+        float y1 = (y1i - pad_y) / scale_y;
+        if (x1 < x0)
+            std::swap(x0, x1);
+        if (y1 < y0)
+            std::swap(y0, y1);
+        x0 = std::max(std::min(x0, float(orig_w - 1)), 0.f);
+        y0 = std::max(std::min(y0, float(orig_h - 1)), 0.f);
+        x1 = std::max(std::min(x1, float(orig_w - 1)), 0.f);
+        y1 = std::max(std::min(y1, float(orig_h - 1)), 0.f);
+
+        obj.rect = cv::Rect_<float>(x0, y0, x1 - x0, y1 - y0);
+
+        obj.label = static_cast<int>(values[5]);
+        obj.prob = score;
+
+        std::cout << "[DEBUG] yolo4-tiny: (" << values[0] << "," << values[1] << "," << values[2] << "," << values[3]
+                  << ") mapped: (" << x0 << "," << y0 << "," << x1 << "," << y1 << ") rect: ("
+                  << obj.rect.x << "," << obj.rect.y << "," << obj.rect.width << "," << obj.rect.height << ")"
+                  << " label: " << obj.label << " prob: " << obj.prob << std::endl;
+
         proposals.push_back(obj);
     }
 
     // NMS
-    std::sort(proposals.begin(), proposals.end(), [](const Object &a, const Object &b)
-              { return a.prob > b.prob; });
-
+    objects.clear();
     std::vector<int> picked;
     for (size_t i = 0; i < proposals.size(); i++)
     {
@@ -96,10 +78,13 @@ void postprocess(const ncnn::Mat &out, std::vector<Object> &objects, float prob_
         for (size_t j = 0; j < picked.size(); j++)
         {
             const Object &b = proposals[picked[j]];
-            // 计算IoU
+            // 只对同类做NMS
+            if (a.label != b.label)
+                continue;
             float inter_area = (a.rect & b.rect).area();
             float union_area = a.rect.area() + b.rect.area() - inter_area;
-            if (inter_area / union_area > nms_threshold)
+            float iou = inter_area / union_area;
+            if (iou > nms_threshold)
             {
                 keep = false;
                 break;
@@ -108,31 +93,63 @@ void postprocess(const ncnn::Mat &out, std::vector<Object> &objects, float prob_
         if (keep)
             picked.push_back(i);
     }
-
-    objects.clear();
     for (size_t i = 0; i < picked.size(); i++)
-        objects.push_back(proposals[picked[i]]);
+    {
+        // 增加padding
+        Object obj = proposals[picked[i]];
+        float pad = 50.0f; // 每边增加5像素
+        obj.rect.x = std::max(obj.rect.x - pad, 0.f);
+        obj.rect.y = std::max(obj.rect.y - pad, 0.f);
+        obj.rect.width = std::min(obj.rect.width + 2 * pad, float(orig_w) - obj.rect.x);
+        obj.rect.height = std::min(obj.rect.height + 2 * pad, float(orig_h) - obj.rect.y);
+        objects.push_back(obj);
+    }
 }
 
 // 目标检测主流程：输入图像，输出检测结果
-void detect_objects(ncnn::Net &net, const cv::Mat &img, std::vector<Object> &objects, int target_size = 416, float prob_threshold = 0.5f, float nms_threshold = 0.45f)
+void detect_objects(ncnn::Net &net, const cv::Mat &img, std::vector<Object> &objects, int target_size = 416, float prob_threshold = 0.8f, float nms_threshold = 0.45f)
 {
-    ncnn::Mat in;
-    // 图像预处理
-    preprocess(img, in, target_size);
+    // 等比例缩放+padding
+    int w = img.cols;
+    int h = img.rows;
+    float scale = std::min(target_size / (w * 1.f), target_size / (h * 1.f));
+    int new_w = int(w * scale);
+    int new_h = int(h * scale);
+    cv::Mat resized;
+    cv::resize(img, resized, cv::Size(new_w, new_h));
+    cv::Mat input = cv::Mat::zeros(target_size, target_size, img.type());
+    int dx = (target_size - new_w) / 2;
+    int dy = (target_size - new_h) / 2;
+    resized.copyTo(input(cv::Rect(dx, dy, new_w, new_h)));
 
-    // 创建ncnn推理器
+    ncnn::Mat in = ncnn::Mat::from_pixels(input.data, ncnn::Mat::PIXEL_BGR, target_size, target_size);
+
+    // 记录缩放和padding参数
+    float scale_x = scale;
+    float scale_y = scale;
+    int pad_x = dx;
+    int pad_y = dy;
+
     ncnn::Extractor ex = net.create_extractor();
-    // 设置输入
     ex.input("data", in);
 
     ncnn::Mat out;
-    // 获取输出
     ex.extract("output", out);
 
-    // 后处理，得到检测结果
-    postprocess(out, objects, prob_threshold, nms_threshold);
+    // 传递padding参数
+    postprocess(out, objects, prob_threshold, nms_threshold, scale_x, scale_y, pad_x, pad_y, w, h);
 }
+
+// COCO 80类名称
+const char *coco_names[] = {
+    "person", "bicycle", "car", "motorbike", "aeroplane", "bus", "train", "truck", "boat", "traffic light",
+    "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+    "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle",
+    "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "sofa", "pottedplant", "bed",
+    "diningtable", "toilet", "tvmonitor", "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave", "oven",
+    "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"};
 
 int main(int argc, char **argv)
 {
@@ -193,7 +210,24 @@ int main(int argc, char **argv)
     for (const auto &obj : objects)
     {
         cv::rectangle(frame, obj.rect, cv::Scalar(0, 255, 0), 2);
-        std::cout << "label: " << obj.label << " prob: " << obj.prob << std::endl;
+        std::string label_text;
+        if (obj.label >= 0 && obj.label < 80)
+            label_text = std::string(coco_names[obj.label]);
+        else
+            label_text = "unknown";
+        char prob_text[32];
+        snprintf(prob_text, sizeof(prob_text), " %.2f", obj.prob);
+        label_text += prob_text;
+
+        int baseLine = 0;
+        cv::Size label_size = cv::getTextSize(label_text, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseLine);
+        int x = std::max(int(obj.rect.x), 0);
+        int y = std::max(int(obj.rect.y), 0);
+        cv::rectangle(frame, cv::Rect(x, y - label_size.height, label_size.width, label_size.height + baseLine),
+                      cv::Scalar(0, 255, 0), cv::FILLED);
+        cv::putText(frame, label_text, cv::Point(x, y), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1);
+
+        std::cout << "label: " << obj.label << " (" << label_text << ")" << " prob: " << obj.prob << std::endl;
     }
     // 保存结果图片
     if (!cv::imwrite("result.jpg", frame))
