@@ -100,3 +100,13 @@ set(ncnn_DIR "your/ncnn/path")
 ## 基础模型地址
 
 https://github.com/nihui/ncnn-assets/tree/master
+
+## demo
+
+```sh
+PS D:\repos\github\yolo-lite> cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=D:/tools/vcpkg/scripts/buildsystems/vcpkg.cmake
+
+PS D:\repos\github\yolo-lite> cmake --build build
+
+PS D:\repos\github\yolo-lite\build\Debug> .\yolo4_ncnn.exe ..\..\model\yolov4-tiny-opt.param ..\..\model\yolov4-tiny-opt.bin ..\..\model\person.jpg
+```
