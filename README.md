@@ -2,7 +2,7 @@
 
 ## 简介
 
-本项目基于 ncnn 和 OpenCV 实现 YOLOv3 目标检测的简易推理与演示。
+本项目基于 ncnn 和 OpenCV 实现 YOLOv4 目标检测的简易推理与演示。
 
 ## 依赖
 
